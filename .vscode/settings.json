@@ -1,5 +1,7 @@
 {
     "cSpell.words": [
+        "BLPOP",
+        "BRPOP",
         "chrono",
         "Codecrafters",
         "Deque",

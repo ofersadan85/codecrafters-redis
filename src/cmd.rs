@@ -1,10 +1,9 @@
-use std::{collections::VecDeque, time::Duration};
-
 use anyhow::{bail, ensure, Context};
-use tokio::time::sleep;
+use std::{collections::VecDeque, time::Duration};
+use tokio::{select, time::sleep};
 use tracing::{debug, warn};
 
-use crate::{resp::RespData, KeyValueStore};
+use crate::{resp::RespData, state::State};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PushPopDirection {
@@ -38,6 +37,9 @@ pub enum Command {
         key: String,
         count: u32,
         direction: PushPopDirection,
+        /// None if not blocking, Some(n) if blocking with timeout n seconds
+        /// Some(0) means blocking indefinitely
+        blocking: Option<u32>,
     },
 }
 
@@ -136,14 +138,7 @@ impl TryFrom<RespData> for Command {
                     let indexes: Vec<i64> = elements
                         .iter()
                         .skip(2)
-                        .filter_map(|arg| match arg {
-                            RespData::Integer(index) => Some(*index),
-                            RespData::SimpleString(index_str) => index_str.parse::<i64>().ok(),
-                            RespData::BulkString(Some(index_str)) => {
-                                String::from_utf8_lossy(index_str).parse::<i64>().ok()
-                            }
-                            _ => None,
-                        })
+                        .filter_map(RespData::as_number)
                         .take(2)
                         .collect();
                     ensure!(
@@ -166,25 +161,27 @@ impl TryFrom<RespData> for Command {
                     bail!("LLEN command requires a key argument");
                 }
             }
-            "LPOP" | "RPOP" => {
+            "LPOP" | "RPOP" | "BLPOP" | "BRPOP" => {
                 if let Some(RespData::BulkString(Some(key))) = elements.get(1) {
-                    let direction = if command == "RPOP" {
+                    let direction = if command.contains("RPOP") {
                         PushPopDirection::Right
                     } else {
                         PushPopDirection::Left
                     };
-                    let count = match elements.get(2) {
-                        Some(RespData::Integer(count)) => u32::try_from(*count)?,
-                        Some(RespData::SimpleString(count_str)) => count_str.parse::<u32>()?,
-                        Some(RespData::BulkString(Some(count_str))) => {
-                            String::from_utf8_lossy(count_str).parse::<u32>()?
-                        }
-                        _ => 1, // Default to popping one element if no count is specified
+                    let mut count = elements.get(2).and_then(RespData::as_number).unwrap_or(1); // Default to popping one element
+                    let blocking = if command.starts_with('B') {
+                        elements.get(2).and_then(RespData::as_number)
+                    } else {
+                        None
                     };
+                    if blocking.is_some() && count == 0 {
+                        count = 1; // If blocking, we pop exactly one element
+                    }
                     Ok(Command::ListPop {
                         key: String::from_utf8_lossy(key).to_string(),
                         count,
                         direction,
+                        blocking,
                     })
                 } else {
                     bail!("LPOP/RPOP command requires a key argument");
@@ -213,14 +210,14 @@ impl TryFrom<&mut &[u8]> for Command {
     }
 }
 
-async fn expire_key(kv: KeyValueStore, key: String, duration: Duration) {
+async fn expire_key(state: State, key: String, duration: Duration) {
     sleep(duration).await;
-    kv.lock().await.remove(&key);
+    state.lock().await.kv.remove(&key);
 }
 
 impl Command {
     #[allow(clippy::too_many_lines)]
-    pub async fn handle(self, kv: KeyValueStore) -> anyhow::Result<RespData> {
+    pub async fn handle(self, state: State) -> anyhow::Result<RespData> {
         let response = match self {
             Command::Ping => RespData::simple_string("PONG"),
             Command::Echo(arg) => RespData::bulk_string(&arg),
@@ -231,16 +228,16 @@ impl Command {
                 args: _args,
             } => {
                 debug!("Setting `{key}` to `{value}`");
-                kv.lock().await.insert(key.clone(), value);
+                state.lock().await.kv.insert(key.clone(), value);
                 if let Some(expires) = expires {
-                    tokio::spawn(expire_key(kv.clone(), key, expires));
+                    tokio::spawn(expire_key(state.clone(), key, expires));
                 }
                 RespData::simple_string("OK")
             }
             Command::Get(key) => {
                 debug!("Getting value for key: {}", key);
-                let store = kv.lock().await;
-                if let Some(value) = store.get(&key) {
+                let state = state.lock().await;
+                if let Some(value) = state.kv.get(&key) {
                     value.clone()
                 } else {
                     RespData::null_bulk_string()
@@ -251,9 +248,10 @@ impl Command {
                 values,
                 direction,
             } => {
-                let mut store = kv.lock().await;
-                let array = store
-                    .entry(key)
+                let mut state = state.lock().await;
+                let array = state
+                    .kv
+                    .entry(key.clone())
                     .or_insert_with(|| RespData::Array(Some(VecDeque::new())));
                 let len = match (array, direction) {
                     (RespData::Array(Some(elements)), PushPopDirection::Right) => {
@@ -268,42 +266,49 @@ impl Command {
                     }
                     _ => unreachable!("known to be an array"),
                 };
+
+                // Notify one waiting client that the list has changed
+                let wait_list = state.waiting_lists.entry(format!("*{key}")).or_default();
+                wait_list.signal.notify_one();
+                // Decrement the count of waiting clients
+                wait_list.count = wait_list.count.saturating_sub(1);
+                state.prune_waiting_lists();
                 RespData::Integer(i64::try_from(len)?)
             }
             Command::ListRange { key, start, end } => {
                 debug!("Getting range for key: {}", key);
-                let store = kv.lock().await;
-                let response_array = if let Some(RespData::Array(Some(elements))) = store.get(&key)
-                {
-                    let len = i64::try_from(elements.len())?;
-                    let start = if start < 0 {
-                        (len + start).max(0)
-                    } else if start >= len {
-                        len
+                let state = state.lock().await;
+                let response_array =
+                    if let Some(RespData::Array(Some(elements))) = state.kv.get(&key) {
+                        let len = i64::try_from(elements.len())?;
+                        let start = if start < 0 {
+                            (len + start).max(0)
+                        } else if start >= len {
+                            len
+                        } else {
+                            start
+                        };
+                        let end = if end < 0 {
+                            (len + end).max(0)
+                        } else if end >= len {
+                            len - 1
+                        } else {
+                            end
+                        };
+                        elements
+                            .iter()
+                            .skip(usize::try_from(start)?)
+                            .take(usize::try_from(end - start + 1)?)
+                            .cloned()
+                            .collect()
                     } else {
-                        start
+                        VecDeque::new()
                     };
-                    let end = if end < 0 {
-                        (len + end).max(0)
-                    } else if end >= len {
-                        len - 1
-                    } else {
-                        end
-                    };
-                    elements
-                        .iter()
-                        .skip(usize::try_from(start)?)
-                        .take(usize::try_from(end - start + 1)?)
-                        .cloned()
-                        .collect()
-                } else {
-                    VecDeque::new()
-                };
                 RespData::array(response_array)
             }
             Command::ListLen(key) => {
-                let store = kv.lock().await;
-                if let Some(RespData::Array(Some(elements))) = store.get(&key) {
+                let state = state.lock().await;
+                if let Some(RespData::Array(Some(elements))) = state.kv.get(&key) {
                     RespData::Integer(i64::try_from(elements.len())?)
                 } else {
                     RespData::Integer(0)
@@ -313,45 +318,76 @@ impl Command {
                 key,
                 count,
                 direction,
+                blocking,
             } => {
-                let mut store = kv.lock().await;
-                let len = if let Some(RespData::Array(Some(elements))) = store.get(&key) {
+                if count == 0 {
+                    // If count is 0, return an empty array (without blocking)
+                    return Ok(RespData::array(VecDeque::new()));
+                }
+                if let Some(blocking) = blocking {
+                    let signal = {
+                        let mut state = state.lock().await;
+                        let wait_list = state.waiting_lists.entry(format!("*{key}")).or_default();
+                        wait_list.count += 1;
+                        wait_list.signal.clone()
+                    }; // Release the lock before waiting
+                    if blocking == 0 {
+                        // Blocking indefinitely
+                        signal.notified().await;
+                    } else {
+                        // Blocking with timeout
+                        select! {
+                            () = signal.notified() => {}
+                            () = sleep(Duration::from_secs(u64::from(blocking))) => {
+                                debug!("Blocking pop for key `{key}` timed out after {blocking} seconds");
+                            }
+                        }
+                    }
+                }
+                let mut state = state.lock().await;
+                let len = if let Some(RespData::Array(Some(elements))) = state.kv.get(&key) {
                     elements.len()
                 } else {
                     0
                 };
                 if len == 0 {
                     // If the list is already empty, remove the key and return an empty array
-                    store.remove(&key);
-                    return Ok(RespData::array(VecDeque::new()));
-                }
-                if count == 0 {
-                    // If count is 0, return an empty array
+                    if blocking.is_some() {
+                        // If we were blocking and still, we return a null bulk string
+                        return Ok(RespData::null_bulk_string());
+                    }
+                    state.kv.remove(&key);
                     return Ok(RespData::array(VecDeque::new()));
                 }
                 if usize::try_from(count).unwrap_or(usize::MAX) > len {
                     // If count is greater or equal than the list length
                     // remove the key and return the entire list
-                    let array = store
+                    let array = state
+                        .kv
                         .remove(&key)
                         .unwrap_or(RespData::Array(Some(VecDeque::new())));
                     return Ok(array);
                 }
                 if count == 1 {
-                    // If count is 1, pop a single element
-                    // However, 1 is a special case as we return the popped value directly
-                    // instead of an array
-                    if let Some(RespData::Array(Some(elements))) = store.get_mut(&key) {
+                    // 1 is a special case as we return the popped value directly
+                    // instead of an array, unless we were blocking, then we
+                    // return an array with the key and the popped value
+                    if let Some(RespData::Array(Some(elements))) = state.kv.get_mut(&key) {
                         let popped_value = match direction {
                             PushPopDirection::Right => elements.pop_back(),
                             PushPopDirection::Left => elements.pop_front(),
-                        };
-                        return Ok(popped_value.expect("Empty list was handled above"));
-                    } else {
-                        return Ok(RespData::array(VecDeque::new()));
+                        }
+                        .expect("Empty list was handled above");
+                        if blocking.is_some() {
+                            let elements =
+                                VecDeque::from([RespData::bulk_string(&key), popped_value]);
+                            return Ok(RespData::array(elements));
+                        }
+                        return Ok(popped_value);
                     }
+                    return Ok(RespData::array(VecDeque::new()));
                 }
-                if let Some(RespData::Array(Some(elements))) = store.get_mut(&key) {
+                let result = if let Some(RespData::Array(Some(elements))) = state.kv.get_mut(&key) {
                     let mut popped_values = VecDeque::new();
                     for _ in 0..count {
                         if let Some(value) = match direction {
@@ -366,7 +402,9 @@ impl Command {
                     RespData::array(popped_values)
                 } else {
                     RespData::array(VecDeque::new())
-                }
+                };
+                state.prune_waiting_lists();
+                result
             }
         };
         Ok(response)

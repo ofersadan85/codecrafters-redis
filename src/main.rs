@@ -1,5 +1,5 @@
 use anyhow::Context;
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -8,18 +8,17 @@ use tokio::{
 };
 use tracing::{debug, error, info, instrument, warn};
 
-use crate::{cmd::Command, resp::RespData};
-
 mod cmd;
 mod resp;
+mod state;
 
-type KeyValueStore = Arc<Mutex<HashMap<String, RespData>>>;
+use crate::{cmd::Command, state::{AppState, State}};
 
-#[instrument(skip(stream))]
+#[instrument(skip(stream, state))]
 async fn handle_client(
     mut stream: TcpStream,
     client: SocketAddr,
-    kv: KeyValueStore,
+    state: State,
 ) -> anyhow::Result<()> {
     // let mut stream = BufStream::new(stream);
     let mut buf = [0; 1024];
@@ -29,11 +28,11 @@ async fn handle_client(
             info!("Disconnected");
             return Ok(());
         }
-        debug!("{}", String::from_utf8_lossy(&buf[..n]));
         let command =
             Command::try_from(&buf[..n]).context("Failed to parse command from buffer")?;
-        debug!("Parsed command: {:?}", command);
-        let response = command.handle(kv.clone()).await?;
+        debug!("Parsed command: {command:?}");
+        let response = command.handle(state.clone()).await?;
+        debug!("Response: {response:?}");
         stream
             .write_all(response.as_bytes().as_slice())
             .await
@@ -51,12 +50,13 @@ async fn handle_ctrl_c() -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let kv = Arc::new(Mutex::new(HashMap::new()));
+    let state = Arc::new(Mutex::new(AppState::default()));
     tracing_subscriber::fmt()
         .with_env_filter("debug")
+        .without_time()
         // .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
         .init();
-    let listener = TcpListener::bind("127.0.0.1:6379")
+    let listener = TcpListener::bind("0.0.0.0:6379")
         .await
         .context("Failed to bind to address")?;
     info!("Server listening on {}", listener.local_addr()?);
@@ -67,9 +67,9 @@ async fn main() -> anyhow::Result<()> {
                 match connection {
                     Ok((stream, client)) => {
                         info!("Accepted connection from {client}");
-                        let kv = kv.clone();
+                        let state = state.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_client(stream, client, kv).await {
+                            if let Err(e) = handle_client(stream, client, state).await {
                                 error!("Error handling client: {e}");
                             }
                         });

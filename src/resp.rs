@@ -67,19 +67,34 @@ fn from_lead_until_crlf(lead: char, value: &[u8]) -> anyhow::Result<&[u8]> {
 
 impl RespData {
     pub fn simple_string(s: impl AsRef<str>) -> Self {
-        RespData::SimpleString(s.as_ref().to_string())
+        Self::SimpleString(s.as_ref().to_string())
     }
 
     pub fn bulk_string(s: impl AsRef<str>) -> Self {
-        RespData::BulkString(Some(s.as_ref().as_bytes().to_vec()))
+        Self::BulkString(Some(s.as_ref().as_bytes().to_vec()))
     }
 
     pub fn null_bulk_string() -> Self {
-        RespData::BulkString(None)
+        Self::BulkString(None)
     }
 
-    pub fn array(elements: VecDeque<RespData>) -> Self {
-        RespData::Array(Some(elements))
+    pub fn array(elements: VecDeque<Self>) -> Self {
+        Self::Array(Some(elements))
+    }
+
+    pub fn as_number<T, E>(&self) -> Option<T>
+    where
+        T: TryFrom<i64, Error = E> + FromStr,
+    {
+        let n = match self {
+            Self::Integer(count) => T::try_from(*count).ok()?,
+            Self::SimpleString(count_str) => count_str.parse::<T>().ok()?,
+            Self::BulkString(Some(count_str)) => {
+                String::from_utf8_lossy(count_str).parse::<T>().ok()?
+            }
+            _ => return None,
+        };
+        Some(n)
     }
 
     pub fn as_bytes(&self) -> Vec<u8> {
