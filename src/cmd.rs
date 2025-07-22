@@ -22,7 +22,7 @@ pub enum Command {
         args: Vec<String>,         // Additional arguments if needed
     },
     Get(String),
-    ListPush(String, RespData, PushDirection),
+    ListPush(String, Vec<RespData>, PushDirection),
 }
 
 impl TryFrom<RespData> for Command {
@@ -99,9 +99,7 @@ impl TryFrom<RespData> for Command {
                 }
             }
             "RPUSH" | "LPUSH" => {
-                if let (Some(RespData::BulkString(Some(key))), Some(value)) =
-                    (elements.get(1), elements.get(2))
-                {
+                if let Some(RespData::BulkString(Some(key))) = elements.get(1) {
                     let direction = if command == "RPUSH" {
                         PushDirection::Right
                     } else {
@@ -109,7 +107,7 @@ impl TryFrom<RespData> for Command {
                     };
                     Ok(Command::ListPush(
                         String::from_utf8_lossy(key).to_string(),
-                        value.clone(),
+                        elements.iter().skip(2).cloned().collect(),
                         direction,
                     ))
                 } else {

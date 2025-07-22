@@ -72,18 +72,20 @@ async fn handle_client(
                     RespData::null_bulk_string().as_bytes()
                 }
             }
-            Command::ListPush(key, value, direction) => {
+            Command::ListPush(key, values, direction) => {
                 let mut store = kv.lock().await;
                 let array = store
                     .entry(key)
                     .or_insert_with(|| RespData::Array(Some(VecDeque::new())));
                 let len = match (array, direction) {
                     (RespData::Array(Some(elements)), PushDirection::Right) => {
-                        elements.push_back(value);
+                        elements.extend(values);
                         elements.len()
                     }
                     (RespData::Array(Some(elements)), PushDirection::Left) => {
-                        elements.push_front(value);
+                        for value in values.into_iter().rev() {
+                            elements.push_front(value);
+                        }
                         elements.len()
                     }
                     _ => unreachable!("known to be an array"),
