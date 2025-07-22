@@ -2,6 +2,12 @@
     "cSpell.words": [
         "chrono",
         "Codecrafters",
-        "Deque"
+        "Deque",
+        "LLEN",
+        "LPOP",
+        "LPUSH",
+        "LRANGE",
+        "RPOP",
+        "RPUSH"
     ]
 }

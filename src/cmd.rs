@@ -7,7 +7,7 @@ use tracing::{debug, warn};
 use crate::{resp::RespData, KeyValueStore};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PushDirection {
+pub enum PushPopDirection {
     Left,
     Right,
 }
@@ -26,7 +26,7 @@ pub enum Command {
     ListPush {
         key: String,
         values: Vec<RespData>,
-        direction: PushDirection,
+        direction: PushPopDirection,
     },
     ListRange {
         key: String,
@@ -34,6 +34,11 @@ pub enum Command {
         end: i64,
     },
     ListLen(String),
+    ListPop {
+        key: String,
+        count: u32,
+        direction: PushPopDirection,
+    },
 }
 
 impl TryFrom<RespData> for Command {
@@ -113,9 +118,9 @@ impl TryFrom<RespData> for Command {
             "RPUSH" | "LPUSH" => {
                 if let Some(RespData::BulkString(Some(key))) = elements.get(1) {
                     let direction = if command == "RPUSH" {
-                        PushDirection::Right
+                        PushPopDirection::Right
                     } else {
-                        PushDirection::Left
+                        PushPopDirection::Left
                     };
                     Ok(Command::ListPush {
                         key: String::from_utf8_lossy(key).to_string(),
@@ -133,6 +138,7 @@ impl TryFrom<RespData> for Command {
                         .skip(2)
                         .filter_map(|arg| match arg {
                             RespData::Integer(index) => Some(*index),
+                            RespData::SimpleString(index_str) => index_str.parse::<i64>().ok(),
                             RespData::BulkString(Some(index_str)) => {
                                 String::from_utf8_lossy(index_str).parse::<i64>().ok()
                             }
@@ -158,6 +164,30 @@ impl TryFrom<RespData> for Command {
                     Ok(Command::ListLen(String::from_utf8_lossy(key).to_string()))
                 } else {
                     bail!("LLEN command requires a key argument");
+                }
+            }
+            "LPOP" | "RPOP" => {
+                if let Some(RespData::BulkString(Some(key))) = elements.get(1) {
+                    let direction = if command == "RPOP" {
+                        PushPopDirection::Right
+                    } else {
+                        PushPopDirection::Left
+                    };
+                    let count = match elements.get(2) {
+                        Some(RespData::Integer(count)) => u32::try_from(*count)?,
+                        Some(RespData::SimpleString(count_str)) => count_str.parse::<u32>()?,
+                        Some(RespData::BulkString(Some(count_str))) => {
+                            String::from_utf8_lossy(count_str).parse::<u32>()?
+                        }
+                        _ => 1, // Default to popping one element if no count is specified
+                    };
+                    Ok(Command::ListPop {
+                        key: String::from_utf8_lossy(key).to_string(),
+                        count,
+                        direction,
+                    })
+                } else {
+                    bail!("LPOP/RPOP command requires a key argument");
                 }
             }
             _ => bail!("Unsupported command"),
@@ -189,6 +219,7 @@ async fn expire_key(kv: KeyValueStore, key: String, duration: Duration) {
 }
 
 impl Command {
+    #[allow(clippy::too_many_lines)]
     pub async fn handle(self, kv: KeyValueStore) -> anyhow::Result<RespData> {
         let response = match self {
             Command::Ping => RespData::simple_string("PONG"),
@@ -225,11 +256,11 @@ impl Command {
                     .entry(key)
                     .or_insert_with(|| RespData::Array(Some(VecDeque::new())));
                 let len = match (array, direction) {
-                    (RespData::Array(Some(elements)), PushDirection::Right) => {
+                    (RespData::Array(Some(elements)), PushPopDirection::Right) => {
                         elements.extend(values);
                         elements.len()
                     }
-                    (RespData::Array(Some(elements)), PushDirection::Left) => {
+                    (RespData::Array(Some(elements)), PushPopDirection::Left) => {
                         for value in values {
                             elements.push_front(value);
                         }
@@ -276,6 +307,65 @@ impl Command {
                     RespData::Integer(i64::try_from(elements.len())?)
                 } else {
                     RespData::Integer(0)
+                }
+            }
+            Command::ListPop {
+                key,
+                count,
+                direction,
+            } => {
+                let mut store = kv.lock().await;
+                let len = if let Some(RespData::Array(Some(elements))) = store.get(&key) {
+                    elements.len()
+                } else {
+                    0
+                };
+                if len == 0 {
+                    // If the list is already empty, remove the key and return an empty array
+                    store.remove(&key);
+                    return Ok(RespData::array(VecDeque::new()));
+                }
+                if count == 0 {
+                    // If count is 0, return an empty array
+                    return Ok(RespData::array(VecDeque::new()));
+                }
+                if usize::try_from(count).unwrap_or(usize::MAX) > len {
+                    // If count is greater or equal than the list length
+                    // remove the key and return the entire list
+                    let array = store
+                        .remove(&key)
+                        .unwrap_or(RespData::Array(Some(VecDeque::new())));
+                    return Ok(array);
+                }
+                if count == 1 {
+                    // If count is 1, pop a single element
+                    // However, 1 is a special case as we return the popped value directly
+                    // instead of an array
+                    if let Some(RespData::Array(Some(elements))) = store.get_mut(&key) {
+                        let popped_value = match direction {
+                            PushPopDirection::Right => elements.pop_back(),
+                            PushPopDirection::Left => elements.pop_front(),
+                        };
+                        return Ok(popped_value.expect("Empty list was handled above"));
+                    } else {
+                        return Ok(RespData::array(VecDeque::new()));
+                    }
+                }
+                if let Some(RespData::Array(Some(elements))) = store.get_mut(&key) {
+                    let mut popped_values = VecDeque::new();
+                    for _ in 0..count {
+                        if let Some(value) = match direction {
+                            PushPopDirection::Right => elements.pop_back(),
+                            PushPopDirection::Left => elements.pop_front(),
+                        } {
+                            popped_values.push_back(value);
+                        } else {
+                            break; // No more elements to pop
+                        }
+                    }
+                    RespData::array(popped_values)
+                } else {
+                    RespData::array(VecDeque::new())
                 }
             }
         };
