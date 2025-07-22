@@ -1,9 +1,10 @@
-use std::time::Duration;
+use std::{collections::VecDeque, time::Duration};
 
 use anyhow::{bail, ensure, Context};
-use tracing::warn;
+use tokio::time::sleep;
+use tracing::{debug, warn};
 
-use crate::resp::RespData;
+use crate::{resp::RespData, KeyValueStore};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PushDirection {
@@ -32,11 +33,13 @@ pub enum Command {
         start: i64,
         end: i64,
     },
+    ListLen(String),
 }
 
 impl TryFrom<RespData> for Command {
     type Error = anyhow::Error;
 
+    #[allow(clippy::too_many_lines)]
     fn try_from(value: RespData) -> Result<Self, Self::Error> {
         let elements = match value {
             RespData::Array(Some(elements)) if !elements.is_empty() => elements,
@@ -137,7 +140,10 @@ impl TryFrom<RespData> for Command {
                         })
                         .take(2)
                         .collect();
-                    ensure!(indexes.len() == 2, "LRANGE command requires two integer indexes");
+                    ensure!(
+                        indexes.len() == 2,
+                        "LRANGE command requires two integer indexes"
+                    );
                     Ok(Command::ListRange {
                         key: String::from_utf8_lossy(key).to_string(),
                         start: indexes[0],
@@ -145,6 +151,13 @@ impl TryFrom<RespData> for Command {
                     })
                 } else {
                     bail!("LRANGE command requires a key argument and two integer indexes");
+                }
+            }
+            "LLEN" => {
+                if let Some(RespData::BulkString(Some(key))) = elements.get(1) {
+                    Ok(Command::ListLen(String::from_utf8_lossy(key).to_string()))
+                } else {
+                    bail!("LLEN command requires a key argument");
                 }
             }
             _ => bail!("Unsupported command"),
@@ -167,5 +180,105 @@ impl TryFrom<&mut &[u8]> for Command {
     fn try_from(value: &mut &[u8]) -> Result<Self, Self::Error> {
         let resp_data = RespData::try_from(value)?;
         Command::try_from(resp_data)
+    }
+}
+
+async fn expire_key(kv: KeyValueStore, key: String, duration: Duration) {
+    sleep(duration).await;
+    kv.lock().await.remove(&key);
+}
+
+impl Command {
+    pub async fn handle(self, kv: KeyValueStore) -> anyhow::Result<RespData> {
+        let response = match self {
+            Command::Ping => RespData::simple_string("PONG"),
+            Command::Echo(arg) => RespData::bulk_string(&arg),
+            Command::Set {
+                key,
+                value,
+                expires,
+                args: _args,
+            } => {
+                debug!("Setting `{key}` to `{value}`");
+                kv.lock().await.insert(key.clone(), value);
+                if let Some(expires) = expires {
+                    tokio::spawn(expire_key(kv.clone(), key, expires));
+                }
+                RespData::simple_string("OK")
+            }
+            Command::Get(key) => {
+                debug!("Getting value for key: {}", key);
+                let store = kv.lock().await;
+                if let Some(value) = store.get(&key) {
+                    value.clone()
+                } else {
+                    RespData::null_bulk_string()
+                }
+            }
+            Command::ListPush {
+                key,
+                values,
+                direction,
+            } => {
+                let mut store = kv.lock().await;
+                let array = store
+                    .entry(key)
+                    .or_insert_with(|| RespData::Array(Some(VecDeque::new())));
+                let len = match (array, direction) {
+                    (RespData::Array(Some(elements)), PushDirection::Right) => {
+                        elements.extend(values);
+                        elements.len()
+                    }
+                    (RespData::Array(Some(elements)), PushDirection::Left) => {
+                        for value in values {
+                            elements.push_front(value);
+                        }
+                        elements.len()
+                    }
+                    _ => unreachable!("known to be an array"),
+                };
+                RespData::Integer(i64::try_from(len)?)
+            }
+            Command::ListRange { key, start, end } => {
+                debug!("Getting range for key: {}", key);
+                let store = kv.lock().await;
+                let response_array = if let Some(RespData::Array(Some(elements))) = store.get(&key)
+                {
+                    let len = i64::try_from(elements.len())?;
+                    let start = if start < 0 {
+                        (len + start).max(0)
+                    } else if start >= len {
+                        len
+                    } else {
+                        start
+                    };
+                    let end = if end < 0 {
+                        (len + end).max(0)
+                    } else if end >= len {
+                        len - 1
+                    } else {
+                        end
+                    };
+                    elements
+                        .iter()
+                        .skip(usize::try_from(start)?)
+                        .take(usize::try_from(end - start + 1)?)
+                        .cloned()
+                        .collect()
+                } else {
+                    VecDeque::new()
+                };
+                RespData::array(response_array)
+            }
+            Command::ListLen(key) => {
+                let store = kv.lock().await;
+                if let Some(RespData::Array(Some(elements))) = store.get(&key) {
+                    RespData::Integer(i64::try_from(elements.len())?)
+                } else {
+                    RespData::Integer(0)
+                }
+            }
+        };
+        Ok(response)
     }
 }

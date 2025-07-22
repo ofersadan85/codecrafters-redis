@@ -82,10 +82,6 @@ impl RespData {
         RespData::Array(Some(elements))
     }
 
-    pub fn null_array() -> Self {
-        RespData::Array(None)
-    }
-
     pub fn as_bytes(&self) -> Vec<u8> {
         match self {
             RespData::SimpleString(s) => format!("+{s}\r\n").into_bytes(),

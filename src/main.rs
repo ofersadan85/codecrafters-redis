@@ -1,33 +1,19 @@
 use anyhow::Context;
-use std::{
-    collections::{HashMap, VecDeque},
-    net::SocketAddr,
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     select,
     sync::Mutex,
-    time::sleep,
 };
 use tracing::{debug, error, info, instrument, warn};
 
-use crate::{
-    cmd::{Command, PushDirection},
-    resp::RespData,
-};
+use crate::{cmd::Command, resp::RespData};
 
 mod cmd;
 mod resp;
 
 type KeyValueStore = Arc<Mutex<HashMap<String, RespData>>>;
-
-async fn expire_key(kv: KeyValueStore, key: String, duration: Duration) {
-    sleep(duration).await;
-    kv.lock().await.remove(&key);
-}
 
 #[instrument(skip(stream))]
 async fn handle_client(
@@ -47,89 +33,9 @@ async fn handle_client(
         let command =
             Command::try_from(&buf[..n]).context("Failed to parse command from buffer")?;
         debug!("Parsed command: {:?}", command);
-        let response = match command {
-            Command::Ping => RespData::simple_string("PONG").as_bytes(),
-            Command::Echo(arg) => RespData::bulk_string(&arg).as_bytes(),
-            Command::Set {
-                key,
-                value,
-                expires,
-                args: _args,
-            } => {
-                debug!("Setting `{key}` to `{value}`");
-                kv.lock().await.insert(key.clone(), value);
-                if let Some(expires) = expires {
-                    tokio::spawn(expire_key(kv.clone(), key, expires));
-                }
-                RespData::simple_string("OK").as_bytes()
-            }
-            Command::Get(key) => {
-                debug!("Getting value for key: {}", key);
-                let store = kv.lock().await;
-                if let Some(value) = store.get(&key) {
-                    value.as_bytes()
-                } else {
-                    RespData::null_bulk_string().as_bytes()
-                }
-            }
-            Command::ListPush {
-                key,
-                values,
-                direction,
-            } => {
-                let mut store = kv.lock().await;
-                let array = store
-                    .entry(key)
-                    .or_insert_with(|| RespData::Array(Some(VecDeque::new())));
-                let len = match (array, direction) {
-                    (RespData::Array(Some(elements)), PushDirection::Right) => {
-                        elements.extend(values);
-                        elements.len()
-                    }
-                    (RespData::Array(Some(elements)), PushDirection::Left) => {
-                        for value in values.into_iter() {
-                            elements.push_front(value);
-                        }
-                        elements.len()
-                    }
-                    _ => unreachable!("known to be an array"),
-                };
-                RespData::Integer(i64::try_from(len)?).as_bytes()
-            }
-            Command::ListRange { key, start, end } => {
-                debug!("Getting range for key: {}", key);
-                let store = kv.lock().await;
-                let response_array = if let Some(RespData::Array(Some(elements))) = store.get(&key)
-                {
-                    let len = i64::try_from(elements.len())?;
-                    let start = if start < 0 {
-                        (len + start).max(0)
-                    } else if start >= len {
-                        len
-                    } else {
-                        start
-                    };
-                    let end = if end < 0 {
-                        (len + end).max(0)
-                    } else if end >= len {
-                        len - 1
-                    } else {
-                        end
-                    };
-                    elements
-                        .iter()
-                        .skip(start as usize)
-                        .take((end - start + 1) as usize)
-                        .cloned()
-                        .collect()
-                } else {
-                    VecDeque::new()
-                };
-                RespData::array(response_array).as_bytes()
-            }
-        };
+        let response = command.handle(kv.clone()).await?;
         stream
-            .write_all(response.as_slice())
+            .write_all(response.as_bytes().as_slice())
             .await
             .context("Failed to write response")?;
     }
