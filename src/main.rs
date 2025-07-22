@@ -1,4 +1,4 @@
-use anyhow::{bail, Context};
+use anyhow::Context;
 use std::net::SocketAddr;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -7,8 +7,9 @@ use tokio::{
 };
 use tracing::{debug, error, info, instrument, warn};
 
-use crate::resp::RespData;
+use crate::{cmd::Command, resp::RespData};
 
+mod cmd;
 mod resp;
 
 #[instrument(skip(stream))]
@@ -22,27 +23,26 @@ async fn handle_client(mut stream: TcpStream, client: SocketAddr) -> anyhow::Res
             return Ok(());
         }
         debug!("{}", String::from_utf8_lossy(&buf[..n]));
-        let msg = RespData::try_from(&mut &buf[..n]).context("Failed to parse RESP data")?;
-        let response = match msg {
-            RespData::Array(Some(elements)) => match elements.get(0).unwrap() {
-                RespData::BulkString(Some(cmd)) if cmd == b"PING" => "+PONG\r\n".to_string(),
-                RespData::BulkString(Some(cmd)) if cmd == b"ECHO" => {
-                    let Some(RespData::BulkString(Some(inner))) = elements.get(1) else {
-                        bail!("ECHO command requires a bulk string argument");
-                    };
-                    format!(
-                        "${}\r\n{}\r\n",
-                        inner.len(),
-                        String::from_utf8_lossy(&inner)
-                    )
-                }
-                _ => bail!("Unsupported command"),
-            },
-            _ => bail!("Unsupported command"),
+        let command =
+            Command::try_from(&buf[..n]).context("Failed to parse command from buffer")?;
+        debug!("Parsed command: {:?}", command);
+        let response = match command {
+            Command::Ping => RespData::simple_string("PONG"),
+            Command::Echo(arg) => RespData::bulk_string(&arg),
+            Command::Set(key, value) => {
+                // Here you would typically set the key-value pair in a store
+                debug!("Setting {} to {}", key, value);
+                RespData::simple_string("OK")
+            }
+            Command::Get(key) => {
+                // Here you would typically get the value for the key from a store
+                debug!("Getting value for key: {}", key);
+                RespData::bulk_string("value") // Placeholder value
+            }
         };
         debug!("Responding with {response}");
         stream
-            .write_all(response.as_bytes())
+            .write_all(response.as_bytes().as_slice())
             .await
             .context("Failed to write response")?;
     }

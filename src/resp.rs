@@ -1,8 +1,5 @@
 use anyhow::{anyhow, bail, ensure};
-use std::{
-    collections::{HashMap, HashSet},
-    str::FromStr,
-};
+use std::{fmt::Display, str::FromStr};
 
 const CRLF: &[u8] = b"\r\n";
 
@@ -15,15 +12,15 @@ pub enum RespData {
     /// :[<+|->]<value>\r\n
     Integer(i64),
     /// $<length>\r\n<data>\r\n
-    /// An empty string is represented as BulkString(Vec::new())
+    /// An empty string is represented as `BulkString(Vec::new())`
     /// An empty string is serialized as $0\r\n\r\n (length 0)
-    /// While a null string is represented as BulkString(None).
+    /// While a null string is represented as `BulkString(None)`.
     /// A null string is serialized as $-1\r\n
     BulkString(Option<Vec<u8>>),
     /// *<number-of-elements>\r\n<element-1>...<element-n>
-    /// An empty array is represented as Array(Vec::new())
+    /// An empty array is represented as `Array(Vec::new())`
     /// An empty array is serialized as *0\r\n
-    /// A null array is represented as Array(None).
+    /// A null array is represented as `Array(None)`.
     /// A null array is serialized as *-1\r\n
     Array(Option<Vec<RespData>>),
     /// _\r\n
@@ -31,24 +28,23 @@ pub enum RespData {
     /// #<t|f>\r\n
     /// #t\r\n is true & #f\r\n is false
     Boolean(bool),
-    /// ,[<+|->]<integral>[.<fractional>][<E|e>[sign]<exponent>]\r\n
-    Float(f64),
-    /// ([+|-]<number>\r\n
-    // TODO: This might be bigger than i128
-    BigNumber(i128),
-    /// !<length>\r\n<error>\r\n
-    BulkError { kind: String, message: String },
-    /// =<length>\r\n<encoding>:<data>\r\n
-    /// Exactly three (3) bytes represent the data's encoding
-    VerbatimString { encoding: String, data: Vec<u8> },
-    /// %<number-of-entries>\r\n<key-1><value-1>...<key-n><value-n>
-    Map(HashMap<RespData, RespData>),
-    /// |<number-of-entries>\r\n<key-1><value-1>...<key-n><value-n>
-    Attributes(HashMap<RespData, RespData>),
-    /// ~<number-of-elements>\r\n<element-1>...<element-n>
-    Set(HashSet<RespData>),
-    /// ><number-of-elements>\r\n<element-1>...<element-n>
-    Push(Vec<RespData>),
+    ///// ,[<+|->]<integral>[.<fractional>][<E|e>[sign]<exponent>]\r\n
+    //// Float(f64),
+    ///// ([+|-]<number>\r\n
+    //// BigNumber(i128), // TODO: This might be bigger than i128
+    ///// !<length>\r\n<error>\r\n
+    //// BulkError { kind: String, message: String },
+    ///// =<length>\r\n<encoding>:<data>\r\n
+    ///// Exactly three (3) bytes represent the data's encoding
+    //// VerbatimString { encoding: String, data: Vec<u8> },
+    ///// %<number-of-entries>\r\n<key-1><value-1>...<key-n><value-n>
+    //// Map(HashMap<RespData, RespData>),
+    ///// |<number-of-entries>\r\n<key-1><value-1>...<key-n><value-n>
+    //// Attributes(HashMap<RespData, RespData>),
+    ///// ~<number-of-elements>\r\n<element-1>...<element-n>
+    //// Set(HashSet<RespData>),
+    ///// ><number-of-elements>\r\n<element-1>...<element-n>
+    //// Push(Vec<RespData>),
 }
 
 fn from_lead_until_crlf(lead: char, value: &[u8]) -> anyhow::Result<&[u8]> {
@@ -70,12 +66,37 @@ fn from_lead_until_crlf(lead: char, value: &[u8]) -> anyhow::Result<&[u8]> {
 }
 
 impl RespData {
-    fn simple_string(s: &impl AsRef<str>) -> Self {
+    pub fn simple_string(s: impl AsRef<str>) -> Self {
         RespData::SimpleString(s.as_ref().to_string())
     }
 
-    fn bulk_string(s: &impl AsRef<str>) -> Self {
+    pub fn bulk_string(s: impl AsRef<str>) -> Self {
         RespData::BulkString(Some(s.as_ref().as_bytes().to_vec()))
+    }
+
+    pub fn as_bytes(&self) -> Vec<u8> {
+        match self {
+            RespData::SimpleString(s) => format!("+{s}\r\n").into_bytes(),
+            RespData::SimpleError { kind, message } => {
+                format!("-{kind} {message}\r\n").into_bytes()
+            }
+            RespData::Integer(num) => format!(":{num}\r\n").into_bytes(),
+            RespData::BulkString(Some(s)) => {
+                format!("${}\r\n{}\r\n", s.len(), String::from_utf8_lossy(s)).into_bytes()
+            }
+            RespData::BulkString(None) => b"$-1\r\n".to_vec(),
+            RespData::Array(Some(elements)) => {
+                let mut result = format!("*{}\r\n", elements.len()).into_bytes();
+                for element in elements {
+                    result.extend_from_slice(&element.as_bytes());
+                }
+                result
+            }
+            RespData::Array(None) => b"*-1\r\n".to_vec(),
+            RespData::Null => b"_\r\n".to_vec(),
+            RespData::Boolean(true) => b"#t\r\n".to_vec(),
+            RespData::Boolean(false) => b"#f\r\n".to_vec(),
+        }
     }
 
     fn parse_simple_string(value: &mut &[u8]) -> anyhow::Result<Self> {
@@ -91,10 +112,13 @@ impl RespData {
         let buf_len = buf.len();
         let s = String::from_utf8(buf.to_vec())?;
         *value = &value[1 /* Leading char */ + buf_len + CRLF.len()..];
+
+        // Clippy gives a false positive here, with `map_unwrap_or` we would have to clone the string
+        #[allow(clippy::map_unwrap_or)]
         let (kind, message) = s
             .split_once(' ')
             .map(|(k, m)| (k.to_string(), m.to_string()))
-            .unwrap_or_else(|| (s, "".to_string()));
+            .unwrap_or_else(|| (s, String::new()));
         Ok(RespData::SimpleError { kind, message })
     }
 
@@ -112,7 +136,7 @@ impl RespData {
             .parse::<usize>()
             .map_err(|e| anyhow!("Invalid length: {e}"))?;
         ensure!(
-            value.len() >= len + CRLF.len() + 1, // +1 for the leading '$'
+            value.len() > len + CRLF.len(), // +1 for the leading '$'
             "Bulk string data length mismatch"
         );
         let start_of_s = 1 /* Leading char */ + buf.len() + CRLF.len();
@@ -135,11 +159,11 @@ impl RespData {
         match len_s.as_str() {
             "0" => {
                 *value = &value[1 /* Leading char */ + buf.len() + CRLF.len()..];
-                return Ok(RespData::Array(Some(Vec::new())));
+                Ok(RespData::Array(Some(Vec::new())))
             }
             "-1" => {
                 *value = &value[1 /* Leading char */ + buf.len() + CRLF.len()..];
-                return Ok(RespData::Array(None));
+                Ok(RespData::Array(None))
             }
             len_s => {
                 let len = len_s
@@ -152,7 +176,7 @@ impl RespData {
                     elements.push(element);
                 }
                 // Note: Array doesn't end with CRLF, so we don't check for it here.
-                return Ok(RespData::Array(Some(elements)));
+                Ok(RespData::Array(Some(elements)))
             }
         }
     }
@@ -229,6 +253,13 @@ impl FromStr for RespData {
     }
 }
 
+impl Display for RespData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let bytes = self.as_bytes();
+        f.write_str(&String::from_utf8_lossy(&bytes))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,7 +269,7 @@ mod tests {
         let mut data = b"+OK\r\n".as_ref();
         let resp = RespData::parse_simple_string(&mut data).unwrap();
         let RespData::SimpleString(s) = resp else {
-            panic!("Expected SimpleString, got {:?}", resp);
+            panic!("Expected SimpleString, got {resp:?}");
         };
         assert_eq!(s, "OK");
         assert!(data.is_empty());
@@ -249,10 +280,10 @@ mod tests {
         let mut data = b"-Error message\r\n".as_ref();
         let resp = RespData::parse_simple_error(&mut data).unwrap();
         let RespData::SimpleError { kind, message } = resp else {
-            panic!("Expected SimpleError, got {:?}", resp);
+            panic!("Expected SimpleError, got {resp:?}");
         };
         assert_eq!(kind, "Error");
-        assert_eq!(message, "message"); 
+        assert_eq!(message, "message");
         assert!(data.is_empty());
     }
 
@@ -261,7 +292,7 @@ mod tests {
         let mut data = b":42\r\n".as_ref();
         let resp = RespData::parse_integer(&mut data).unwrap();
         let RespData::Integer(num) = resp else {
-            panic!("Expected Integer, got {:?}", resp);
+            panic!("Expected Integer, got {resp:?}");
         };
         assert_eq!(num, 42);
         assert!(data.is_empty());
@@ -272,7 +303,7 @@ mod tests {
         let mut data = b"$5\r\nHello\r\n".as_ref();
         let resp = RespData::parse_bulk_string(&mut data).unwrap();
         let RespData::BulkString(Some(s)) = resp else {
-            panic!("Expected BulkString, got {:?}", resp);
+            panic!("Expected BulkString, got {resp:?}");
         };
         assert_eq!(s, "Hello".as_bytes());
         assert!(data.is_empty());
@@ -283,7 +314,7 @@ mod tests {
         let mut data = b"*3\r\n_\r\n_\r\n_\r\n".as_ref();
         let resp = RespData::parse_array(&mut data).unwrap();
         let RespData::Array(Some(elements)) = resp else {
-            panic!("Expected Array, got {:?}", resp);
+            panic!("Expected Array, got {resp:?}");
         };
         assert_eq!(elements.len(), 3);
         assert!(elements.iter().all(|e| matches!(e, RespData::Null)));
