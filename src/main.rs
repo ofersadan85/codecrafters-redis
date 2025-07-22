@@ -1,4 +1,4 @@
-use anyhow::Context;
+use anyhow::{bail, Context};
 use std::net::SocketAddr;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -6,6 +6,10 @@ use tokio::{
     select,
 };
 use tracing::{debug, error, info, instrument, warn};
+
+use crate::resp::RespData;
+
+mod resp;
 
 #[instrument(skip(stream))]
 async fn handle_client(mut stream: TcpStream, client: SocketAddr) -> anyhow::Result<()> {
@@ -17,24 +21,30 @@ async fn handle_client(mut stream: TcpStream, client: SocketAddr) -> anyhow::Res
             info!("Disconnected");
             return Ok(());
         }
-        let s = String::from_utf8_lossy(&buf);
-        for line in s.lines() {
-            if line.starts_with("PING") {
-                let mut message = line.trim_start_matches("PING").trim();
-                if message.is_empty() {
-                    message = "PONG";
+        debug!("{}", String::from_utf8_lossy(&buf[..n]));
+        let msg = RespData::try_from(&mut &buf[..n]).context("Failed to parse RESP data")?;
+        let response = match msg {
+            RespData::Array(Some(elements)) => match elements.get(0).unwrap() {
+                RespData::BulkString(Some(cmd)) if cmd == b"PING" => "+PONG\r\n".to_string(),
+                RespData::BulkString(Some(cmd)) if cmd == b"ECHO" => {
+                    let Some(RespData::BulkString(Some(inner))) = elements.get(1) else {
+                        bail!("ECHO command requires a bulk string argument");
+                    };
+                    format!(
+                        "${}\r\n{}\r\n",
+                        inner.len(),
+                        String::from_utf8_lossy(&inner)
+                    )
                 }
-                let message = format!("+{}\r\n", message);
-                debug!("Responding with {message}");
-                stream
-                    .write_all(message.as_bytes())
-                    .await
-                    .context("Failed to write response")?;
-            } else {
-                warn!("Unsupported command ({n}): {line}");
-                // bail!("Unsupported command ({n}): {line}");
-            }
-        }
+                _ => bail!("Unsupported command"),
+            },
+            _ => bail!("Unsupported command"),
+        };
+        debug!("Responding with {response}");
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .context("Failed to write response")?;
     }
 }
 
