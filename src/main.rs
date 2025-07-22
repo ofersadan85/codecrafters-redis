@@ -87,7 +87,7 @@ async fn handle_client(
                         elements.len()
                     }
                     (RespData::Array(Some(elements)), PushDirection::Left) => {
-                        for value in values.into_iter().rev() {
+                        for value in values.into_iter() {
                             elements.push_front(value);
                         }
                         elements.len()
