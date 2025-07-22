@@ -72,7 +72,11 @@ async fn handle_client(
                     RespData::null_bulk_string().as_bytes()
                 }
             }
-            Command::ListPush(key, values, direction) => {
+            Command::ListPush {
+                key,
+                values,
+                direction,
+            } => {
                 let mut store = kv.lock().await;
                 let array = store
                     .entry(key)
@@ -91,6 +95,37 @@ async fn handle_client(
                     _ => unreachable!("known to be an array"),
                 };
                 RespData::Integer(i64::try_from(len)?).as_bytes()
+            }
+            Command::ListRange { key, start, end } => {
+                debug!("Getting range for key: {}", key);
+                let store = kv.lock().await;
+                let response_array = if let Some(RespData::Array(Some(elements))) = store.get(&key)
+                {
+                    let len = i64::try_from(elements.len())?;
+                    let start = if start < 0 {
+                        (len + start).max(0)
+                    } else if start >= len {
+                        len
+                    } else {
+                        start
+                    };
+                    let end = if end < 0 {
+                        (len + end).max(0)
+                    } else if end >= len {
+                        len - 1
+                    } else {
+                        end
+                    };
+                    elements
+                        .iter()
+                        .skip(start as usize)
+                        .take((end - start + 1) as usize)
+                        .cloned()
+                        .collect()
+                } else {
+                    VecDeque::new()
+                };
+                RespData::array(response_array).as_bytes()
             }
         };
         stream

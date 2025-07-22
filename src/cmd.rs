@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use anyhow::{bail, Context};
+use anyhow::{bail, ensure, Context};
 use tracing::warn;
 
 use crate::resp::RespData;
@@ -22,7 +22,16 @@ pub enum Command {
         args: Vec<String>,         // Additional arguments if needed
     },
     Get(String),
-    ListPush(String, Vec<RespData>, PushDirection),
+    ListPush {
+        key: String,
+        values: Vec<RespData>,
+        direction: PushDirection,
+    },
+    ListRange {
+        key: String,
+        start: i64,
+        end: i64,
+    },
 }
 
 impl TryFrom<RespData> for Command {
@@ -105,13 +114,37 @@ impl TryFrom<RespData> for Command {
                     } else {
                         PushDirection::Left
                     };
-                    Ok(Command::ListPush(
-                        String::from_utf8_lossy(key).to_string(),
-                        elements.iter().skip(2).cloned().collect(),
+                    Ok(Command::ListPush {
+                        key: String::from_utf8_lossy(key).to_string(),
+                        values: elements.iter().skip(2).cloned().collect(),
                         direction,
-                    ))
+                    })
                 } else {
                     bail!("RPUSH command requires a key argument and a value");
+                }
+            }
+            "LRANGE" => {
+                if let Some(RespData::BulkString(Some(key))) = elements.get(1) {
+                    let indexes: Vec<i64> = elements
+                        .iter()
+                        .skip(2)
+                        .filter_map(|arg| match arg {
+                            RespData::Integer(index) => Some(*index),
+                            RespData::BulkString(Some(index_str)) => {
+                                String::from_utf8_lossy(index_str).parse::<i64>().ok()
+                            }
+                            _ => None,
+                        })
+                        .take(2)
+                        .collect();
+                    ensure!(indexes.len() == 2, "LRANGE command requires two integer indexes");
+                    Ok(Command::ListRange {
+                        key: String::from_utf8_lossy(key).to_string(),
+                        start: indexes[0],
+                        end: indexes[1],
+                    })
+                } else {
+                    bail!("LRANGE command requires a key argument and two integer indexes");
                 }
             }
             _ => bail!("Unsupported command"),
