@@ -1,4 +1,7 @@
-use anyhow::bail;
+use std::time::Duration;
+
+use anyhow::{bail, Context};
+use tracing::warn;
 
 use crate::resp::RespData;
 
@@ -6,7 +9,12 @@ use crate::resp::RespData;
 pub enum Command {
     Ping,
     Echo(String),
-    Set(String, String),
+    Set {
+        key: String,
+        value: String,
+        expires: Option<Duration>, // Optional expiration duration
+        args: Vec<String>,         // Additional arguments if needed
+    },
     Get(String),
 }
 
@@ -33,10 +41,36 @@ impl TryFrom<RespData> for Command {
                         Some(RespData::BulkString(Some(value))),
                     ) = (elements.get(1), elements.get(2))
                     {
-                        Ok(Command::Set(
-                            String::from_utf8_lossy(key).to_string(),
-                            String::from_utf8_lossy(value).to_string(),
-                        ))
+                        let args: Vec<String> = elements[3..]
+                            .iter()
+                            .filter_map(|arg| {
+                                if let RespData::BulkString(Some(arg)) = arg {
+                                    Some(String::from_utf8_lossy(arg).to_string())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+                        let px = args.iter().position(|s| s.to_uppercase() == "PX");
+                        let expires = if let Some(px_index) = px {
+                            if px_index + 1 < args.len() {
+                                let millis: u64 = args[px_index + 1]
+                                    .parse()
+                                    .context("Failed to parse expiration duration")?;
+                                Some(Duration::from_millis(millis))
+                            } else {
+                                warn!("PX argument requires a value");
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        Ok(Command::Set {
+                            key: String::from_utf8_lossy(key).to_string(),
+                            value: String::from_utf8_lossy(value).to_string(),
+                            expires,
+                            args,
+                        })
                     } else {
                         bail!("SET command requires bulk string arguments for key and value");
                     }

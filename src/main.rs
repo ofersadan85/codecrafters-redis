@@ -1,10 +1,11 @@
 use anyhow::Context;
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     select,
     sync::Mutex,
+    time::sleep,
 };
 use tracing::{debug, error, info, instrument, warn};
 
@@ -14,6 +15,11 @@ mod cmd;
 mod resp;
 
 type KeyValueStore = Arc<Mutex<HashMap<String, String>>>;
+
+async fn expire_key(kv: KeyValueStore, key: String, duration: Duration) {
+    sleep(duration).await;
+    kv.lock().await.remove(&key);
+}
 
 #[instrument(skip(stream))]
 async fn handle_client(
@@ -36,10 +42,18 @@ async fn handle_client(
         let response = match command {
             Command::Ping => RespData::simple_string("PONG"),
             Command::Echo(arg) => RespData::bulk_string(&arg),
-            Command::Set(key, value) => {
+            Command::Set {
+                key,
+                value,
+                expires,
+                args: _args
+            } => {
                 // Here you would typically set the key-value pair in a store
-                debug!("Setting {} to {}", key, value);
-                kv.lock().await.insert(key, value);
+                debug!("Setting `{key}` to `{value}`");
+                kv.lock().await.insert(key.clone(), value);
+                if let Some(expires) = expires {
+                    tokio::spawn(expire_key(kv.clone(), key, expires));
+                }
                 RespData::simple_string("OK")
             }
             Command::Get(key) => {
