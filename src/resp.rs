@@ -1,5 +1,5 @@
 use anyhow::{anyhow, bail, ensure};
-use std::{fmt::Display, str::FromStr};
+use std::{collections::VecDeque, fmt::Display, str::FromStr};
 
 const CRLF: &[u8] = b"\r\n";
 
@@ -22,7 +22,7 @@ pub enum RespData {
     /// An empty array is serialized as *0\r\n
     /// A null array is represented as `Array(None)`.
     /// A null array is serialized as *-1\r\n
-    Array(Option<Vec<RespData>>),
+    Array(Option<VecDeque<RespData>>),
     /// _\r\n
     Null,
     /// #<t|f>\r\n
@@ -163,7 +163,7 @@ impl RespData {
         match len_s.as_str() {
             "0" => {
                 *value = &value[1 /* Leading char */ + buf.len() + CRLF.len()..];
-                Ok(RespData::Array(Some(Vec::new())))
+                Ok(RespData::Array(Some(VecDeque::new())))
             }
             "-1" => {
                 *value = &value[1 /* Leading char */ + buf.len() + CRLF.len()..];
@@ -174,10 +174,10 @@ impl RespData {
                     .parse::<usize>()
                     .map_err(|e| anyhow!("Invalid length: {e}"))?;
                 *value = &value[1 /* Leading char */ + buf.len() + CRLF.len()..];
-                let mut elements = Vec::with_capacity(len);
+                let mut elements = VecDeque::with_capacity(len);
                 for _ in 0..len {
                     let element = Self::from_bytes(value)?;
-                    elements.push(element);
+                    elements.push_back(element);
                 }
                 // Note: Array doesn't end with CRLF, so we don't check for it here.
                 Ok(RespData::Array(Some(elements)))

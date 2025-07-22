@@ -1,5 +1,10 @@
 use anyhow::Context;
-use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, VecDeque},
+    net::SocketAddr,
+    sync::Arc,
+    time::Duration,
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -9,12 +14,15 @@ use tokio::{
 };
 use tracing::{debug, error, info, instrument, warn};
 
-use crate::{cmd::Command, resp::RespData};
+use crate::{
+    cmd::{Command, PushDirection},
+    resp::RespData,
+};
 
 mod cmd;
 mod resp;
 
-type KeyValueStore = Arc<Mutex<HashMap<String, String>>>;
+type KeyValueStore = Arc<Mutex<HashMap<String, RespData>>>;
 
 async fn expire_key(kv: KeyValueStore, key: String, duration: Duration) {
     sleep(duration).await;
@@ -40,36 +48,51 @@ async fn handle_client(
             Command::try_from(&buf[..n]).context("Failed to parse command from buffer")?;
         debug!("Parsed command: {:?}", command);
         let response = match command {
-            Command::Ping => RespData::simple_string("PONG"),
-            Command::Echo(arg) => RespData::bulk_string(&arg),
+            Command::Ping => RespData::simple_string("PONG").as_bytes(),
+            Command::Echo(arg) => RespData::bulk_string(&arg).as_bytes(),
             Command::Set {
                 key,
                 value,
                 expires,
-                args: _args
+                args: _args,
             } => {
-                // Here you would typically set the key-value pair in a store
                 debug!("Setting `{key}` to `{value}`");
                 kv.lock().await.insert(key.clone(), value);
                 if let Some(expires) = expires {
                     tokio::spawn(expire_key(kv.clone(), key, expires));
                 }
-                RespData::simple_string("OK")
+                RespData::simple_string("OK").as_bytes()
             }
             Command::Get(key) => {
-                // Here you would typically get the value for the key from a store
                 debug!("Getting value for key: {}", key);
                 let store = kv.lock().await;
                 if let Some(value) = store.get(&key) {
-                    RespData::bulk_string(value)
+                    value.as_bytes()
                 } else {
-                    RespData::null_bulk_string()
+                    RespData::null_bulk_string().as_bytes()
                 }
             }
+            Command::ListPush(key, value, direction) => {
+                let mut store = kv.lock().await;
+                let array = store
+                    .entry(key)
+                    .or_insert_with(|| RespData::Array(Some(VecDeque::new())));
+                let len = match (array, direction) {
+                    (RespData::Array(Some(elements)), PushDirection::Right) => {
+                        elements.push_back(value);
+                        elements.len()
+                    }
+                    (RespData::Array(Some(elements)), PushDirection::Left) => {
+                        elements.push_front(value);
+                        elements.len()
+                    }
+                    _ => unreachable!("known to be an array"),
+                };
+                RespData::Integer(i64::try_from(len)?).as_bytes()
+            }
         };
-        debug!("Responding with {response}");
         stream
-            .write_all(response.as_bytes().as_slice())
+            .write_all(response.as_slice())
             .await
             .context("Failed to write response")?;
     }
