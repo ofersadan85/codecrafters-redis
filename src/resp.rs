@@ -74,6 +74,10 @@ impl RespData {
         RespData::BulkString(Some(s.as_ref().as_bytes().to_vec()))
     }
 
+    pub fn null_bulk_string() -> Self {
+        RespData::BulkString(None)
+    }
+
     pub fn as_bytes(&self) -> Vec<u8> {
         match self {
             RespData::SimpleString(s) => format!("+{s}\r\n").into_bytes(),

@@ -1,9 +1,10 @@
 use anyhow::Context;
-use std::net::SocketAddr;
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     select,
+    sync::Mutex,
 };
 use tracing::{debug, error, info, instrument, warn};
 
@@ -12,8 +13,14 @@ use crate::{cmd::Command, resp::RespData};
 mod cmd;
 mod resp;
 
+type KeyValueStore = Arc<Mutex<HashMap<String, String>>>;
+
 #[instrument(skip(stream))]
-async fn handle_client(mut stream: TcpStream, client: SocketAddr) -> anyhow::Result<()> {
+async fn handle_client(
+    mut stream: TcpStream,
+    client: SocketAddr,
+    kv: KeyValueStore,
+) -> anyhow::Result<()> {
     // let mut stream = BufStream::new(stream);
     let mut buf = [0; 1024];
     loop {
@@ -32,12 +39,18 @@ async fn handle_client(mut stream: TcpStream, client: SocketAddr) -> anyhow::Res
             Command::Set(key, value) => {
                 // Here you would typically set the key-value pair in a store
                 debug!("Setting {} to {}", key, value);
+                kv.lock().await.insert(key, value);
                 RespData::simple_string("OK")
             }
             Command::Get(key) => {
                 // Here you would typically get the value for the key from a store
                 debug!("Getting value for key: {}", key);
-                RespData::bulk_string("value") // Placeholder value
+                let store = kv.lock().await;
+                if let Some(value) = store.get(&key) {
+                    RespData::bulk_string(value)
+                } else {
+                    RespData::null_bulk_string()
+                }
             }
         };
         debug!("Responding with {response}");
@@ -58,6 +71,7 @@ async fn handle_ctrl_c() -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let kv = Arc::new(Mutex::new(HashMap::new()));
     tracing_subscriber::fmt()
         .with_env_filter("debug")
         // .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
@@ -73,8 +87,9 @@ async fn main() -> anyhow::Result<()> {
                 match connection {
                     Ok((stream, client)) => {
                         info!("Accepted connection from {client}");
+                        let kv = kv.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_client(stream, client).await {
+                            if let Err(e) = handle_client(stream, client, kv).await {
                                 error!("Error handling client: {e}");
                             }
                         });
