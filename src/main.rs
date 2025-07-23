@@ -1,4 +1,5 @@
 use anyhow::Context;
+use clap::Parser;
 use std::{net::SocketAddr, sync::Arc};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -8,6 +9,7 @@ use tokio::{
 };
 use tracing::{debug, error, info, instrument, warn};
 
+mod cli;
 mod cmd;
 mod resp;
 mod state;
@@ -50,13 +52,15 @@ async fn handle_ctrl_c() -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let cli = cli::Cli::parse();
+    let addr = SocketAddr::new(cli.host.into(), cli.port);
     let state = Arc::new(Mutex::new(AppState::default()));
     tracing_subscriber::fmt()
         .with_env_filter("debug")
         .without_time()
         // .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
         .init();
-    let listener = TcpListener::bind("0.0.0.0:6379")
+    let listener = TcpListener::bind(addr)
         .await
         .context("Failed to bind to address")?;
     info!("Server listening on {}", listener.local_addr()?);
