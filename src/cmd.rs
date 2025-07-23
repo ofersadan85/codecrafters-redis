@@ -39,7 +39,7 @@ pub enum Command {
         direction: PushPopDirection,
         /// None if not blocking, Some(n) if blocking with timeout n seconds
         /// Some(0) means blocking indefinitely
-        blocking: Option<u32>,
+        blocking: Option<f64>,
     },
 }
 
@@ -170,7 +170,7 @@ impl TryFrom<RespData> for Command {
                     };
                     let mut count = elements.get(2).and_then(RespData::as_number).unwrap_or(1); // Default to popping one element
                     let blocking = if command.starts_with('B') {
-                        elements.get(2).and_then(RespData::as_number)
+                        elements.get(2).and_then(RespData::as_float)
                     } else {
                         None
                     };
@@ -331,14 +331,14 @@ impl Command {
                         wait_list.count += 1;
                         wait_list.signal.clone()
                     }; // Release the lock before waiting
-                    if blocking == 0 {
+                    if blocking == 0.0 {
                         // Blocking indefinitely
                         signal.notified().await;
                     } else {
                         // Blocking with timeout
                         select! {
                             () = signal.notified() => {}
-                            () = sleep(Duration::from_secs(u64::from(blocking))) => {
+                            () = sleep(Duration::from_secs_f64(blocking)) => {
                                 debug!("Blocking pop for key `{key}` timed out after {blocking} seconds");
                             }
                         }

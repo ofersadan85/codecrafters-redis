@@ -97,6 +97,15 @@ impl RespData {
         Some(n)
     }
 
+    pub fn as_float(&self) -> Option<f64> {
+        match self {
+            Self::Integer(n) => Some(u32::try_from(*n).map(f64::from).ok()?),
+            Self::SimpleString(s) => s.parse::<f64>().ok(),
+            Self::BulkString(Some(s)) => String::from_utf8_lossy(s).parse::<f64>().ok(),
+            _ => None,
+        }
+    }
+
     pub fn as_bytes(&self) -> Vec<u8> {
         match self {
             RespData::SimpleString(s) => format!("+{s}\r\n").into_bytes(),
