@@ -9,4 +9,4 @@ anyhow = "1.0.98"
 clap = { version = "4.5.41", features = ["derive", "env", "cargo"] }
 tokio = { version = "1.46.1", features = ["full"] }
 tracing = { version = "0.1.41", features = ["async-await"] }
-tracing-subscriber = { version = "0.3.19", features = ["env-filter", "chrono"] }
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "chrono"] }
